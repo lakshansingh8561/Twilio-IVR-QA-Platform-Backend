@@ -433,17 +433,34 @@ export const updateAttemptStatus = async (attemptId, status, duration = 0, resul
   if (attemptErr) throw attemptErr;
 
   // If completing, failing, or forcing a retry, free the phone line
-  if (['completed', 'verified', 'failed', 'retry'].includes(status) && updatedAttempt && updatedAttempt.phone_line_id) {
-    const { data: line, error: lineFetchErr } = await supabase
-      .from('phone_lines')
-      .select('attempts_processed')
-      .eq('id', updatedAttempt.phone_line_id)
-      .single();
+  const normalizedStatus = (status || '').toLowerCase();
+  if (['completed', 'verified', 'failed', 'canceled', 'retry'].includes(normalizedStatus) && updatedAttempt) {
+    if (updatedAttempt.phone_line_id) {
+      const { data: line, error: lineFetchErr } = await supabase
+        .from('phone_lines')
+        .select('attempts_processed')
+        .eq('id', updatedAttempt.phone_line_id)
+        .single();
 
-    if (!lineFetchErr && line) {
-      await PhoneLineModel.updateLineStatus(updatedAttempt.phone_line_id, 'idle', null, {
-        attempts_processed: (line.attempts_processed || 0) + 1
-      });
+      if (!lineFetchErr && line) {
+        await PhoneLineModel.updateLineStatus(updatedAttempt.phone_line_id, 'idle', null, {
+          attempts_processed: (line.attempts_processed || 0) + 1
+        });
+      }
+    } else {
+      // Also check and free any line associated with this attemptId
+      const { data: lines } = await supabase
+        .from('phone_lines')
+        .select('id, attempts_processed')
+        .eq('current_attempt_id', attemptId);
+
+      if (lines && lines.length > 0) {
+        for (const l of lines) {
+          await PhoneLineModel.updateLineStatus(l.id, 'idle', null, {
+            attempts_processed: (l.attempts_processed || 0) + 1
+          });
+        }
+      }
     }
   }
 
