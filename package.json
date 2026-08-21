@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "npx kill-port 5000 && nodemon src/app.js",
+    "build": "echo 'Backend build complete'",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

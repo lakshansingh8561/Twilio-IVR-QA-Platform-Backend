@@ -238,6 +238,9 @@ export const handleInteractiveListen = async (req, res) => {
   }
 };
 
+// Alias for backwards compatibility with any remaining /try endpoints
+export const handleTryCode = handleInteractiveListen;
+
 // Webhook for tracking call status updates from Twilio and triggering next sequential attempt
 export const handleStatusCallback = async (req, res) => {
   const { attemptId } = req.params;
