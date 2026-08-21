@@ -118,29 +118,22 @@ export const getDashboardStatus = async (req, res) => {
         }
       }
 
-      // Build target list with individual 16-digit values, candidate lists, and 3-digit target codes
+      // Build target list with individual 16-digit values and auto-generated 3-digit target CVV
       const targets = valuesList.map(digitVal => {
+        // Auto-generate secret 3-digit target CVV randomly (001-999) if not supplied
         let code = validExplicitCode;
         if (!code) {
-          // Generate secret 3-digit target code randomly (001-999)
           const randomNum = Math.floor(Math.random() * 999) + 1;
           code = randomNum.toString().padStart(3, '0');
-        }
-
-        // Ensure candidate list has candidates, including target code
-        let sessionCandidates = parsedCandidates.length > 0 ? [...parsedCandidates] : ['001', '002', code, '004', '005'];
-        if (!sessionCandidates.includes(code) && parsedCandidates.length === 0) {
-          sessionCandidates.splice(2, 0, code);
         }
 
         return {
           sixteen_digit: digitVal,
           masked_test_number: AttemptModel.maskTestNumber(digitVal),
-          test_value: `${digitVal}:${sessionCandidates[0] || '001'}`,
+          test_value: `${digitVal}:001`,
           target_test_code: code,
-          current_test_code: sessionCandidates[0] || '001',
-          test_candidates: sessionCandidates,
-          current_candidate_index: 0,
+          current_test_code: '001',
+          current_candidate_index: 1,
           candidate_attempts: [],
           transcriptions: [],
           state: 'CALL_CREATED',

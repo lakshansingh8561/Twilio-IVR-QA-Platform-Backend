@@ -105,10 +105,10 @@ export const getTwiML = async (req, res) => {
   }
 };
 
-// Webhook for handling controlled test code candidates verification loop
+// Webhook for handling automated 001-999 test code candidates verification loop
 export const handleTryCode = async (req, res) => {
   const { attemptId } = req.params;
-  let { isFirst, candidateIndex } = req.query;
+  let { isFirst, currentTestCode, candidateIndex } = req.query;
 
   const twiml = new twilio.twiml.VoiceResponse();
   const host = resolveHostUrl(req);
@@ -128,26 +128,23 @@ export const handleTryCode = async (req, res) => {
 
     const rawCard = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132');
     const targetTestCode = attempt.target_test_code ? String(attempt.target_test_code).padStart(3, '0') : '003';
-    const candidateList = Array.isArray(attempt.test_candidates) && attempt.test_candidates.length > 0 
-      ? attempt.test_candidates 
-      : ['001', '002', targetTestCode, '004'];
 
-    let currentIndex = parseInt(candidateIndex, 10);
-    if (isNaN(currentIndex) || currentIndex < 0) currentIndex = 0;
+    let currentCodeNum = parseInt(currentTestCode || candidateIndex, 10);
+    if (isNaN(currentCodeNum) || currentCodeNum < 1) currentCodeNum = 1;
 
-    // Safety check: candidate list exhausted
-    if (currentIndex >= candidateList.length) {
+    // Safety check: codes exhausted 001-999
+    if (currentCodeNum > 999) {
       await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.FAILED, {
         failure_reason: stateMachine.FAILURE_REASONS.CANDIDATES_EXHAUSTED,
-        failure_message: `Exhausted all ${candidateList.length} configured test candidates without acceptance.`
+        failure_message: `Exhausted all 3-digit test codes (001-999) without acceptance.`
       });
-      await AttemptModel.addStructuredLog(attemptId, 'CALL_FAILED', `All ${candidateList.length} candidates exhausted without acceptance.`);
+      await AttemptModel.addStructuredLog(attemptId, 'CALL_FAILED', `Exhausted all 3-digit codes (001-999) without acceptance.`);
       twiml.hangup();
       res.type('text/xml');
       return res.send(twiml.toString());
     }
 
-    const currentCandidate = String(candidateList[currentIndex]).padStart(3, '0');
+    const currentCandidate = currentCodeNum.toString().padStart(3, '0');
 
     // 1. Initial Prompt on First Attempt
     if (isFirst === 'true') {
@@ -158,12 +155,13 @@ export const handleTryCode = async (req, res) => {
       await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.CODE_REQUEST_DETECTED);
     }
 
-    // 2. Testing current candidate
+    // 2. Testing current candidate code
     await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.TESTING_CODE, {
-      current_candidate_index: currentIndex,
-      current_test_code: currentCandidate
+      current_candidate_index: currentCodeNum,
+      current_test_code: currentCandidate,
+      test_value: `${rawCard}:${currentCandidate}`
     });
-    await AttemptModel.addStructuredLog(attemptId, 'TESTING_CODE', `Testing candidate: ${currentCandidate} (${currentIndex + 1}/${candidateList.length})`);
+    await AttemptModel.addStructuredLog(attemptId, 'TESTING_CODE', `Testing code: ${currentCandidate}`);
 
     const isMatch = (currentCandidate === targetTestCode);
 
@@ -195,34 +193,34 @@ export const handleTryCode = async (req, res) => {
         winner: currentCandidate,
         verified: true
       });
-      await AttemptModel.addStructuredLog(attemptId, 'TEST_CODE_ACCEPTED', `Candidate ${currentCandidate} accepted. Test verified.`);
-      await AttemptModel.addStructuredLog(attemptId, 'CALL_COMPLETED', `Automated IVR QA Test PASSED with candidate ${currentCandidate}.`);
+      await AttemptModel.addStructuredLog(attemptId, 'TEST_CODE_ACCEPTED', `Code ${currentCandidate} MATCHED with target code.`);
+      await AttemptModel.addStructuredLog(attemptId, 'CALL_COMPLETED', `Automated IVR QA Test PASSED with code ${currentCandidate}.`);
 
       twiml.pause({ length: 2 });
       twiml.hangup();
     } else {
       // INCORRECT CODE
-      const incorrectPrompt = "Incorrect security code. Please enter your three digit test code.";
+      const incorrectPrompt = "Incorrect security code. Please try entering your three digit test code again.";
       const classifiedIncorrect = instructionClassifier.classifyInstruction(incorrectPrompt);
       await AttemptModel.recordTranscription(attemptId, incorrectPrompt, classifiedIncorrect.instructionType, classifiedIncorrect.confidence);
 
       await AttemptModel.recordCandidateAttempt(attemptId, currentCandidate, 'INCORRECT', incorrectPrompt);
-      await AttemptModel.addStructuredLog(attemptId, 'TEST_CODE_REJECTED', `Candidate ${currentCandidate} rejected by IVR.`);
+      await AttemptModel.addStructuredLog(attemptId, 'TEST_CODE_REJECTED', `Code ${currentCandidate} not matched.`);
 
-      const nextIndex = currentIndex + 1;
-      if (nextIndex >= candidateList.length) {
+      const nextCodeNum = currentCodeNum + 1;
+      if (nextCodeNum > 999) {
         await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.FAILED, {
           failure_reason: stateMachine.FAILURE_REASONS.CANDIDATES_EXHAUSTED,
-          failure_message: `All ${candidateList.length} configured candidates were rejected by IVR.`
+          failure_message: `All 3-digit test codes (001-999) were rejected by IVR.`
         });
-        await AttemptModel.addStructuredLog(attemptId, 'CALL_FAILED', `Candidate testing completed: No matching code found.`);
+        await AttemptModel.addStructuredLog(attemptId, 'CALL_FAILED', `Code testing completed: No matching code found.`);
         twiml.pause({ length: 1 });
         twiml.hangup();
       } else {
-        const nextCandidate = String(candidateList[nextIndex]).padStart(3, '0');
-        await AttemptModel.addStructuredLog(attemptId, 'NEXT_CONFIGURED_CANDIDATE', `Advancing to next candidate: ${nextCandidate}`);
+        const nextCandidate = nextCodeNum.toString().padStart(3, '0');
+        await AttemptModel.addStructuredLog(attemptId, 'NEXT_CONFIGURED_CANDIDATE', `Advancing to next code: ${nextCandidate}`);
         twiml.pause({ length: 2 });
-        twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?candidateIndex=${nextIndex}&isFirst=false`);
+        twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?currentTestCode=${nextCodeNum}&isFirst=false`);
       }
     }
 
