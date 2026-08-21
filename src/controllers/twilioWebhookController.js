@@ -38,7 +38,7 @@ const resolveHostUrl = (req) => {
 import * as instructionClassifier from '../services/instructionClassifierService.js';
 import * as stateMachine from '../services/ivrStateMachineService.js';
 
-// Generate TwiML for when the call is answered (Outbound Automated QA Flow)
+// Generate TwiML for when each sequential attempt call is answered
 export const getTwiML = async (req, res) => {
   const { attemptId } = req.params;
   try {
@@ -55,43 +55,27 @@ export const getTwiML = async (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
 
     let rawCard = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '');
+    let testCode = attempt.current_test_code || (attempt.test_value && attempt.test_value.includes(':') ? attempt.test_value.split(':')[1] : '001');
     const masked = AttemptModel.maskTestNumber(rawCard);
-    const host = resolveHostUrl(req);
 
-    // 1. Initial State: CALL_CONNECTED
+    // 1. Mark call connected
     await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.CALL_CONNECTED);
-    await AttemptModel.addStructuredLog(attemptId, 'CALL_CONNECTED', `Twilio call answered. Test Session active.`);
-    await AttemptModel.addStructuredLog(attemptId, 'WAITING_FOR_NUMBER_REQUEST', `Listening for initial IVR speech prompt.`);
+    await AttemptModel.addStructuredLog(attemptId, 'CALL_CONNECTED', `Twilio call connected to ${attempt.destination_number || attempt.target_phone_number || 'destination'}.`);
+    await AttemptModel.addStructuredLog(attemptId, 'WAITING_FOR_NUMBER_REQUEST', `Waiting for IVR speech prompt and intro audio.`);
 
-    // 2. Classify IVR Initial Speech Prompt
-    const initialPrompt = "Welcome to the automated verification system. Please enter your 16 digit test number.";
-    const classified = instructionClassifier.classifyInstruction(initialPrompt);
-    await AttemptModel.recordTranscription(attemptId, initialPrompt, classified.instructionType, classified.confidence);
+    // 2. Wait for the initial IVR welcome / greeting (e.g. 40 seconds)
+    const waitSeconds = parseInt(process.env.DTMF_WAIT_DELAY_SECONDS) || 40;
+    twiml.pause({ length: waitSeconds });
 
-    // 3. State transition
-    const transition = stateMachine.transitionState(attempt, classified);
-
-    if (transition.isTerminal && transition.nextState === stateMachine.STATES.FAILED) {
-      await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.FAILED, {
-        failure_reason: transition.failureReason,
-        failure_message: transition.failureMessage
-      });
-      await AttemptModel.addStructuredLog(attemptId, 'CALL_FAILED', `Validation failed: ${transition.failureMessage}`);
-      twiml.say('Invalid synthetic test number.');
-      twiml.hangup();
-      res.type('text/xml');
-      return res.send(twiml.toString());
-    }
-
-    // Number Verified
-    await AttemptModel.updateSessionState(attemptId, stateMachine.STATES.NUMBER_VERIFIED, {
-      masked_test_number: masked
-    });
-    await AttemptModel.addStructuredLog(attemptId, 'NUMBER_VERIFIED', `Synthetic 16-digit test number accepted and verified.`);
+    // 3. Transmit 16-digit card DTMF followed by 3-digit test code DTMF
     await AttemptModel.addStructuredLog(attemptId, 'DTMF_SENT', `Sending 16-digit test number: ${masked}`);
+    await AttemptModel.addStructuredLog(attemptId, 'TESTING_CODE', `Testing 3-digit code: ${testCode}`);
+    
+    twiml.play({ digits: `ww${rawCard}wwww${testCode}` });
 
-    // Redirect to test code verification loop
-    twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?isFirst=true&candidateIndex=0`);
+    // 4. Pause to capture IVR response audio before hanging up
+    twiml.pause({ length: 15 });
+    twiml.hangup();
 
     res.type('text/xml');
     return res.send(twiml.toString());

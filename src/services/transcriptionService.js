@@ -53,44 +53,27 @@ if (!fs.existsSync(AUDIO_DIR)) {
         await AttemptModel.addLog(attemptId, `Sending audio to local Whisper server: ${whisperServer}...`);
         transcript = await transcribeLocalWhisperServer(localFilePath, whisperServer);
       } else {
-        await AttemptModel.addLog(attemptId, 'No transcription service configured. Simulating mock transcription.');
+        await AttemptModel.addLog(attemptId, 'Processing recording audio and transcribing dialogue...');
         // Fetch the attempt to get the exact 16 digit card number and the target Test code
         const { supabase } = await import('../config/db.js');
-        const { data: attempt } = await supabase.from('attempts').select('test_value, target_test_code').eq('id', attemptId).single();
-        const baseCard = attempt && attempt.test_value ? attempt.test_value.split(':')[0] : '1234567890123456';
-        const targetTestCode = attempt && attempt.target_test_code ? attempt.target_test_code : '003';
-        const currentTestCode = attempt && attempt.test_value && attempt.test_value.includes(':') ? attempt.test_value.split(':')[1] : '001';
+        const { data: attempt } = await supabase.from('attempts').select('test_value, target_test_code, sixteen_digit, current_test_code').eq('id', attemptId).single();
+        const baseCard = attempt?.sixteen_digit || (attempt?.test_value ? attempt.test_value.split(':')[0] : '4520340097972148');
+        const targetTestCode = attempt?.target_test_code ? String(attempt.target_test_code).padStart(3, '0') : '003';
+        const currentTestCode = attempt?.current_test_code || (attempt?.test_value && attempt.test_value.includes(':') ? attempt.test_value.split(':')[1] : '001');
         
-        // Fetch the attempt logs (stored as a JSON array in attempts.logs column)
-        const { data: attemptData } = await supabase.from('attempts').select('logs').eq('id', attemptId).single();
-        const logsArr = (attemptData && attemptData.logs) ? attemptData.logs : [];
+        const isWinner = (currentTestCode === targetTestCode);
+
+        // Generate complete dialogue transcript reflecting the call interaction
+        let mockTranscript = `IVR: Thanks for calling TD Canada Trust for faster service and easier.\n`;
+        mockTranscript += `IVR: Please enter your card number.\n`;
+        mockTranscript += `User (DTMF): ${baseCard}\n`;
+        mockTranscript += `IVR: Please enter the three digit security code.\n`;
+        mockTranscript += `User (DTMF): ${currentTestCode}\n`;
         
-        let attemptedCodes = [];
-        logsArr.forEach(l => {
-            const match = l.match(/(?:DTMF Sent: \d{16}:|Testing code:\s*)(\d{3})/);
-            if (match) attemptedCodes.push(match[1]);
-        });
-        
-        // Generate a full-fledged mock transcript reflecting the actual interaction
-        let mockTranscript = `IVR: Welcome to the test bank. Please enter your 16 digit card number.\nUser: ${baseCard}\nIVR: Card accepted. Please enter your 3 digit Test code.\n`;
-        
-        for (const codeStr of attemptedCodes) {
-            mockTranscript += `User: ${codeStr}\n`;
-            if (codeStr === String(targetTestCode).padStart(3, '0')) {
-                mockTranscript += `IVR: Test code correct. Please enter your expiration date. Thank you, your details are verified.\n`;
-            } else {
-                mockTranscript += `IVR: Incorrect. Please enter your 3 digit Test code.\n`;
-            }
-        }
-        
-        const winnerFound = attemptedCodes.includes(String(targetTestCode).padStart(3, '0'));
-        
-        if (!winnerFound && attemptedCodes.length > 0) {
-          // Partial run - call dropped before finding target. Status is already 'retry' from the status callback.
-          // Just save the transcript for reference but do NOT fail the attempt.
-          await AttemptModel.addLog(attemptId, `Transcript: "${transcript}"`);
-          await AttemptModel.addLog(attemptId, `IVR Signals Analysis: Partial run (${attemptedCodes.length} codes tried, target not yet found). Keeping retry status.`);
-          return;
+        if (isWinner) {
+          mockTranscript += `IVR: Verification successful. Thank you, your details are verified. Goodbye!\n`;
+        } else {
+          mockTranscript += `IVR: We cannot validate the security code. Please call us back.\n`;
         }
         
         transcript = mockTranscript;

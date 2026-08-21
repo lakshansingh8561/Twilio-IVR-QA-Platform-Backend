@@ -118,8 +118,12 @@ export const getDashboardStatus = async (req, res) => {
         }
       }
 
-      // Build target list with individual 16-digit values and auto-generated 3-digit target CVV
-      const targets = valuesList.map(digitVal => {
+      // Build target list with sequential 3-digit test codes: 001, 002, 003, 004, ...
+      // Each attempt executes as an independent call on the IVR
+      const QUEUED_COUNT = 50; // Queues the first 50 sequential call attempts
+      const targets = [];
+
+      valuesList.forEach(digitVal => {
         // Auto-generate secret 3-digit target CVV randomly (001-999) if not supplied
         let code = validExplicitCode;
         if (!code) {
@@ -127,19 +131,22 @@ export const getDashboardStatus = async (req, res) => {
           code = randomNum.toString().padStart(3, '0');
         }
 
-        return {
-          sixteen_digit: digitVal,
-          masked_test_number: AttemptModel.maskTestNumber(digitVal),
-          test_value: `${digitVal}:001`,
-          target_test_code: code,
-          current_test_code: '001',
-          current_candidate_index: 1,
-          candidate_attempts: [],
-          transcriptions: [],
-          state: 'CALL_CREATED',
-          phone_number: destPhone,
-          from_number: fromPhone
-        };
+        for (let i = 1; i <= QUEUED_COUNT; i++) {
+          const codeStr = i.toString().padStart(3, '0');
+          targets.push({
+            sixteen_digit: digitVal,
+            masked_test_number: AttemptModel.maskTestNumber(digitVal),
+            test_value: `${digitVal}:${codeStr}`,
+            target_test_code: code,
+            current_test_code: codeStr,
+            current_candidate_index: i,
+            candidate_attempts: [],
+            transcriptions: [],
+            state: 'CALL_CREATED',
+            phone_number: destPhone,
+            from_number: fromPhone
+          });
+        }
       });
 
       // Also sync Mock IVR config with current target test value & code
@@ -155,21 +162,21 @@ export const getDashboardStatus = async (req, res) => {
       // Ensure no old/stuck queued attempts from previous runs get picked up
       await OrchestratorService.cancelPendingAttempts();
 
-      // Store multiple 16-digit values under the same IVR test batch
+      // Store sequential call attempts under the same IVR test batch
       const createdAttempts = await AttemptModel.createAttemptBatch(targets, batchId);
       
       // Kicks off sequential attempt processing
       OrchestratorService.startCampaign(targetLineId || phoneNumberId, maxRetries);
 
       // Return masked responses for safety
-      const safeAttempts = (createdAttempts || []).map(a => ({
+      const safeAttempts = (createdAttempts || []).slice(0, 10).map(a => ({
         ...a,
         sixteen_digit: AttemptModel.maskTestNumber(a.sixteen_digit),
         target_test_code: '***' // Hide secret expected code from client
       }));
 
       return res.status(200).json({
-        message: `IVR QA Test Session started successfully with ${targets.length} attempt(s).`,
+        message: `IVR QA Test Campaign started with ${targets.length} sequential call attempts.`,
         batchId,
         targetCount: targets.length,
         attempts: safeAttempts

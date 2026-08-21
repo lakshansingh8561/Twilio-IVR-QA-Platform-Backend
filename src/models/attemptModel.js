@@ -460,7 +460,8 @@ export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode
     if (attemptErr) throw attemptErr;
 
     // If completing, failing, or forcing a retry, free the phone line
-    if (['completed', 'verified', 'failed', 'retry'].includes(status) && updatedAttempt && updatedAttempt.phone_line_id) {
+    const sLower = (status || '').toLowerCase();
+    if (['completed', 'verified', 'failed', 'retry', 'passed'].includes(sLower) && updatedAttempt && updatedAttempt.phone_line_id) {
       const { data: line, error: lineFetchErr } = await supabase
         .from('phone_lines')
         .select('attempts_processed')
