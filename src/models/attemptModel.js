@@ -1,3 +1,7 @@
+import { supabase } from '../config/db.js';
+import { broadcast } from '../services/websocketService.js';
+import * as PhoneLineModel from './phoneLineModel.js';
+
 // Masking helper for 16-digit synthetic test numbers
 export const maskTestNumber = (numberStr) => {
   if (!numberStr) return '';
@@ -27,8 +31,6 @@ const broadcastWithPhone = async (attemptId) => {
   }
   return null;
 };
-import { broadcast } from '../services/websocketService.js';
-import * as PhoneLineModel from './phoneLineModel.js';
 
 // Generate a unique attempt ID string (e.g., ATT-1700000000000-X7A9B)
 export const generateUniqueAttemptId = () => {
