@@ -1,6 +1,13 @@
-import { supabase } from '../config/db.js';
+// Masking helper for 16-digit synthetic test numbers
+export const maskTestNumber = (numberStr) => {
+  if (!numberStr) return '';
+  const digits = String(numberStr).replace(/\D/g, '');
+  if (digits.length <= 4) return digits;
+  const last4 = digits.slice(-4);
+  return `************${last4}`;
+};
 
-// Helper to broadcast attempts with joined phone_number
+// Helper to broadcast attempts with joined phone_number and masked credentials
 const broadcastWithPhone = async (attemptId) => {
   const { data: fullAttempt } = await supabase
     .from('attempts')
@@ -9,8 +16,10 @@ const broadcastWithPhone = async (attemptId) => {
     .single();
     
   if (fullAttempt) {
+    const rawCard = fullAttempt.sixteen_digit || (fullAttempt.test_value ? fullAttempt.test_value.split(':')[0] : '');
     const formatted = {
       ...fullAttempt,
+      masked_test_number: fullAttempt.masked_test_number || maskTestNumber(rawCard),
       phone_number: fullAttempt.phone_lines ? fullAttempt.phone_lines.phone_number : null
     };
     broadcast('attempt_update', formatted);
@@ -34,18 +43,26 @@ export const generateRandomTestCode = () => {
 };
 
 // Create a new test attempt
-export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode = null) => {
+export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode = null, testCandidates = null) => {
     const uniqueAttemptId = generateUniqueAttemptId();
     const sixteenDigit = testValue.includes(':') ? testValue.split(':')[0] : testValue;
     const testCode = targetTestCode || generateRandomTestCode();
-    const initialLog = `[${new Date().toISOString()}] Attempt created. Attempt ID: ${uniqueAttemptId}, Status: queued.`;
+    const masked = maskTestNumber(sixteenDigit);
+    const candidates = testCandidates || ['001', '002', testCode, '004'];
+    const initialLog = `[${new Date().toISOString()}] [CALL_CREATED] Test Session initialized. Attempt ID: ${uniqueAttemptId}, Test Number: ${masked}, Status: QUEUED.`;
     
     const record = {
       attempt_id: uniqueAttemptId,
       sixteen_digit: sixteenDigit,
+      masked_test_number: masked,
       target_test_code: testCode,
-      current_test_code: '001',
-      test_value: `${sixteenDigit}:001`,
+      current_test_code: candidates[0] || '001',
+      test_candidates: candidates,
+      current_candidate_index: 0,
+      candidate_attempts: [],
+      transcriptions: [],
+      state: 'CALL_CREATED',
+      test_value: `${sixteenDigit}:${candidates[0] || '001'}`,
       target_phone_number: targetPhoneNumber,
       status: 'queued',
       logs: [initialLog]
@@ -304,13 +321,21 @@ export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode
       const uniqueAttemptId = generateUniqueAttemptId();
       const sixteenDigit = t.sixteen_digit || (t.test_value ? t.test_value.split(':')[0] : t.card_number || '');
       const testCode = t.target_test_code || generateRandomTestCode();
-      const currentCode = t.current_test_code || testCode || '001';
+      const masked = maskTestNumber(sixteenDigit);
+      const candidates = t.test_candidates || (t.target_test_code ? ['001', '002', t.target_test_code, '004'] : ['001', '002', '003', '004', '005']);
+      const currentCode = candidates[0] || t.current_test_code || '001';
 
       return {
         attempt_id: uniqueAttemptId,
         sixteen_digit: sixteenDigit,
+        masked_test_number: masked,
         target_test_code: testCode,
         current_test_code: currentCode,
+        test_candidates: candidates,
+        current_candidate_index: 0,
+        candidate_attempts: [],
+        transcriptions: [],
+        state: 'CALL_CREATED',
         target_phone_number: t.phone_number || t.target_phone_number || '+12495075171',
         destination_number: t.phone_number || t.destination_number || t.target_phone_number || '+12495075171',
         from_number: t.from_number || null,
@@ -318,7 +343,7 @@ export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode
         test_value: `${sixteenDigit}:${currentCode}`,
         batch_id: batchId,
         status: 'QUEUED',
-        logs: [`[${new Date().toISOString()}] Attempt created in batch ${batchId}. Attempt ID: ${uniqueAttemptId}, 16-digit value: ${sixteenDigit}, Target test code: ${testCode}. Status: QUEUED.`]
+        logs: [`[${new Date().toISOString()}] [CALL_CREATED] Test Session initialized in batch ${batchId}. Attempt ID: ${uniqueAttemptId}, Test Number: ${masked}, Status: QUEUED.`]
       };
     });
 
@@ -451,5 +476,154 @@ export const createAttempt = async (testValue, targetPhoneNumber, targetTestCode
 
     return updatedAttempt;
   };
+
+  // Add structured log with category tag
+  export const addStructuredLog = async (attemptId, tag, message) => {
+    const formatted = `[${new Date().toISOString()}] [${tag}] ${message}`;
+    console.log(`[Attempt #${attemptId}] [${tag}] ${message}`);
+
+    const { data: attempt, error: fetchErr } = await supabase
+      .from('attempts')
+      .select('logs')
+      .eq('id', attemptId)
+      .single();
+    if (fetchErr) return null;
+
+    const newLogs = [...(attempt.logs || []), formatted];
+
+    const { data: updatedAttempt, error: attemptErr } = await supabase
+      .from('attempts')
+      .update({
+        logs: newLogs,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', attemptId)
+      .select()
+      .single();
+
+    if (!attemptErr && updatedAttempt) {
+      await broadcastWithPhone(updatedAttempt.id);
+      return updatedAttempt;
+    }
+    return null;
+  };
+
+  // Record an IVR transcription and classified instruction
+  export const recordTranscription = async (attemptId, transcript, instructionType, confidence) => {
+    const { data: attempt } = await supabase
+      .from('attempts')
+      .select('transcriptions, logs')
+      .eq('id', attemptId)
+      .single();
+
+    if (!attempt) return;
+
+    const transcriptionRecord = {
+      transcript,
+      instructionType,
+      confidence: typeof confidence === 'number' ? Number(confidence.toFixed(2)) : 0.90,
+      timestamp: new Date().toISOString()
+    };
+
+    const currentList = Array.isArray(attempt.transcriptions) ? attempt.transcriptions : [];
+    const updatedList = [...currentList, transcriptionRecord];
+
+    const transcriptLog = `[${new Date().toISOString()}] [IVR_TRANSCRIPT] "${transcript}"`;
+    const instructionLog = `[${new Date().toISOString()}] [INSTRUCTION_DETECTED] ${instructionType} (Confidence: ${(transcriptionRecord.confidence * 100).toFixed(0)}%)`;
+
+    const updatedLogs = [...(attempt.logs || []), transcriptLog, instructionLog];
+
+    const { data: updated } = await supabase
+      .from('attempts')
+      .update({
+        transcriptions: updatedList,
+        logs: updatedLogs,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', attemptId)
+      .select()
+      .single();
+
+    if (updated) {
+      await broadcastWithPhone(updated.id);
+    }
+    return updated;
+  };
+
+  // Record a controlled candidate attempt (e.g. Candidate 001 -> INCORRECT)
+  export const recordCandidateAttempt = async (attemptId, candidate, result, transcript = '') => {
+    const { data: attempt } = await supabase
+      .from('attempts')
+      .select('candidate_attempts, logs, attempt_id')
+      .eq('id', attemptId)
+      .single();
+
+    if (!attempt) return;
+
+    const subAttemptId = `${attempt.attempt_id || `ATT-${attemptId}`}-CAND-${candidate}`;
+    const attemptRecord = {
+      attemptId: subAttemptId,
+      candidate: String(candidate),
+      result: result, // 'INCORRECT' | 'SUCCESS' | 'PENDING'
+      transcript: transcript || '',
+      timestamp: new Date().toISOString()
+    };
+
+    const currentAttempts = Array.isArray(attempt.candidate_attempts) ? attempt.candidate_attempts : [];
+    const updatedAttempts = [...currentAttempts, attemptRecord];
+
+    const tag = result === 'SUCCESS' ? 'TEST_CODE_ACCEPTED' : 'TEST_CODE_REJECTED';
+    const resultLog = `[${new Date().toISOString()}] [${tag}] Candidate ${candidate} evaluated as: ${result}.`;
+
+    const updatedLogs = [...(attempt.logs || []), resultLog];
+
+    const { data: updated } = await supabase
+      .from('attempts')
+      .update({
+        candidate_attempts: updatedAttempts,
+        current_test_code: candidate,
+        logs: updatedLogs,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', attemptId)
+      .select()
+      .single();
+
+    if (updated) {
+      await broadcastWithPhone(updated.id);
+    }
+    return updated;
+  };
+
+  // Update explicit state machine state
+  export const updateSessionState = async (attemptId, state, additionalFields = {}) => {
+    const { data: attempt } = await supabase
+      .from('attempts')
+      .select('logs')
+      .eq('id', attemptId)
+      .single();
+
+    const stateLog = `[${new Date().toISOString()}] [STATE_TRANSITION] State changed to: ${state}.`;
+    const updatedLogs = attempt ? [...(attempt.logs || []), stateLog] : [stateLog];
+
+    const { data: updated } = await supabase
+      .from('attempts')
+      .update({
+        state: state,
+        status: state === 'PASSED' ? 'VERIFIED' : (state === 'FAILED' ? 'FAILED' : 'active'),
+        ...additionalFields,
+        logs: updatedLogs,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', attemptId)
+      .select()
+      .single();
+
+    if (updated) {
+      await broadcastWithPhone(updated.id);
+    }
+    return updated;
+  };
+
 
 

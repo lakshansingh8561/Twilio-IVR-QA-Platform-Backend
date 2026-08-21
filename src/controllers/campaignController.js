@@ -52,9 +52,25 @@ export const getDashboardStatus = async (req, res) => {
 
 
 
-  // Start IVR Test Campaign (Supports single or multiple 16-digit DTMF values)
+  // Start IVR Test Campaign (Supports single or multiple 16-digit DTMF values and controlled candidate testing)
   export const startTestCodeBruteForce = async (req, res) => {
-    const { phoneNumberId, fromPhoneNumber, sixteenDigits, sixteenDigit, testValue, toPhoneNumber, destinationNumber, expectedTestCode, targetTestCode, testCode, maxRetries } = req.body;
+    const {
+      phoneNumberId,
+      fromPhoneNumber,
+      sixteenDigits,
+      sixteenDigit,
+      testValue,
+      toPhoneNumber,
+      destinationNumber,
+      expectedTestCode,
+      targetTestCode,
+      testCode,
+      candidates,
+      candidateList,
+      testCandidates,
+      maxRetries
+    } = req.body;
+
     try {
       // 1. Extract array of 16-digit DTMF values
       let valuesList = [];
@@ -69,15 +85,24 @@ export const getDashboardStatus = async (req, res) => {
       }
 
       if (valuesList.length === 0) {
-        return res.status(400).json({ error: 'At least one valid 16-digit DTMF value is required.' });
+        return res.status(400).json({ error: 'At least one valid synthetic 16-digit test value is required.' });
       }
 
       // Explicit target test code check
       const explicitCode = expectedTestCode || targetTestCode || testCode;
       const validExplicitCode = (explicitCode && /^\d{3}$/.test(String(explicitCode))) ? String(explicitCode) : null;
 
+      // Extract or build controlled candidate list
+      let parsedCandidates = [];
+      const rawCandidates = candidates || candidateList || testCandidates;
+      if (Array.isArray(rawCandidates)) {
+        parsedCandidates = rawCandidates.map(c => String(c).padStart(3, '0')).filter(c => /^\d{3}$/.test(c));
+      } else if (typeof rawCandidates === 'string' && rawCandidates.trim()) {
+        parsedCandidates = rawCandidates.split(/[\n,\s]+/).map(c => c.padStart(3, '0')).filter(c => /^\d{3}$/.test(c));
+      }
+
       // Generate a common IVR test batch ID
-      const batchId = `IVR_TEST_${Date.now()}`;
+      const batchId = `IVR_QA_${Date.now()}`;
       
       const destPhone = destinationNumber || toPhoneNumber || '+12495075171';
       const fromPhone = fromPhoneNumber || null;
@@ -93,7 +118,7 @@ export const getDashboardStatus = async (req, res) => {
         }
       }
 
-      // Build target list with individual 16-digit values and 3-digit test codes
+      // Build target list with individual 16-digit values, candidate lists, and 3-digit target codes
       const targets = valuesList.map(digitVal => {
         let code = validExplicitCode;
         if (!code) {
@@ -102,11 +127,23 @@ export const getDashboardStatus = async (req, res) => {
           code = randomNum.toString().padStart(3, '0');
         }
 
+        // Ensure candidate list has candidates, including target code
+        let sessionCandidates = parsedCandidates.length > 0 ? [...parsedCandidates] : ['001', '002', code, '004', '005'];
+        if (!sessionCandidates.includes(code) && parsedCandidates.length === 0) {
+          sessionCandidates.splice(2, 0, code);
+        }
+
         return {
           sixteen_digit: digitVal,
-          test_value: `${digitVal}:${code}`,
+          masked_test_number: AttemptModel.maskTestNumber(digitVal),
+          test_value: `${digitVal}:${sessionCandidates[0] || '001'}`,
           target_test_code: code,
-          current_test_code: '001',
+          current_test_code: sessionCandidates[0] || '001',
+          test_candidates: sessionCandidates,
+          current_candidate_index: 0,
+          candidate_attempts: [],
+          transcriptions: [],
+          state: 'CALL_CREATED',
           phone_number: destPhone,
           from_number: fromPhone
         };
@@ -131,14 +168,21 @@ export const getDashboardStatus = async (req, res) => {
       // Kicks off sequential attempt processing
       OrchestratorService.startCampaign(targetLineId || phoneNumberId, maxRetries);
 
+      // Return masked responses for safety
+      const safeAttempts = (createdAttempts || []).map(a => ({
+        ...a,
+        sixteen_digit: AttemptModel.maskTestNumber(a.sixteen_digit),
+        target_test_code: '***' // Hide secret expected code from client
+      }));
+
       return res.status(200).json({
-        message: `IVR Test Campaign started successfully with ${targets.length} attempt(s).`,
+        message: `IVR QA Test Session started successfully with ${targets.length} attempt(s).`,
         batchId,
         targetCount: targets.length,
-        attempts: createdAttempts
+        attempts: safeAttempts
       });
     } catch (error) {
-      console.error('Error starting Test code campaign:', error);
+      console.error('Error starting QA test campaign:', error);
       return res.status(500).json({ error: error.message });
     }
   };
