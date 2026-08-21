@@ -160,14 +160,11 @@ export const tick = async () => {
     const attempt = await AttemptModel.claimNextQueuedAttempt(line.id);
     console.log("fetch attempts:", attempt)
     if (!attempt) {
-      // No queued attempts. Check if we have failed attempts that should be retried.
-      await checkAndScheduleRetries();
-
-      // Auto-stop campaign if there are absolutely no active, queued, or retry attempts left
+      // Auto-stop campaign if there are absolutely no active or queued attempts left
       const { count, error } = await supabase
         .from('attempts')
         .select('*', { count: 'exact', head: true })
-        .in('status', ['queued', 'retry', 'active', 'in_progress', 'testing_3digit']);
+        .in('status', ['queued', 'active', 'in_progress', 'testing_3digit']);
 
       if (!error && count === 0) {
         console.log('[Orchestrator] All queues are completely empty. Auto-stopping campaign.');
@@ -176,7 +173,7 @@ export const tick = async () => {
       break;
     }
 
-    console.log(`[Orchestrator] Assigning Attempt #${attempt.id} to Phone Line ${line.phone_number}`);
+    console.log(`[Orchestrator] Assigning Attempt #${attempt.id} (Code: ${attempt.current_test_code}) to Phone Line ${line.phone_number}`);
 
     // Place the call
     executeCall(attempt, line);
@@ -222,48 +219,5 @@ export const executeCall = async (attempt, line) => {
     console.error(`[Orchestrator] Twilio Call failed for Attempt #${attempt.id}:`, err);
     await AttemptModel.addLog(attempt.id, `Twilio error: ${err.message}`);
     await AttemptModel.updateAttemptStatus(attempt.id, 'FAILED', 0, { error: err.message });
-  }
-};
-
-export const checkAndScheduleRetries = async () => {
-  // Look for attempts in the current run that have failed and have remaining retries
-  const { data: failedAttempts, error: fetchErr } = await supabase
-    .from('attempts')
-    .select('*')
-    .eq('status', 'failed')
-    .lt('retry_count', maxRetries);
-
-  if (fetchErr) {
-    console.error('[Orchestrator] Error fetching attempts for retry:', fetchErr);
-    return;
-  }
-
-  if (!failedAttempts || failedAttempts.length === 0) return;
-
-  const rescheduled = [];
-  const logMsg = `[${new Date().toISOString()}] Automatically rescheduled for retry.`;
-
-  for (const attempt of failedAttempts) {
-    const newLogs = [...(attempt.logs || []), logMsg];
-    const { data: updatedAttempt, error: updateErr } = await supabase
-      .from('attempts')
-      .update({
-        status: 'retry',
-        retry_count: (attempt.retry_count || 0) + 1,
-        logs: newLogs,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', attempt.id)
-      .select()
-      .single();
-
-    if (!updateErr && updatedAttempt) {
-      rescheduled.push(updatedAttempt);
-    }
-  }
-
-  if (rescheduled.length > 0) {
-    console.log(`[Orchestrator] Rescheduled ${rescheduled.length} failed attempts for retry.`);
-    rescheduled.forEach(attempt => broadcast('attempt_update', attempt));
   }
 };
