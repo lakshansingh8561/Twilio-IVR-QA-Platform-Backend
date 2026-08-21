@@ -304,7 +304,7 @@ export const createAttemptBatch = async (targets, batchId) => {
     const uniqueAttemptId = generateUniqueAttemptId();
     const sixteenDigit = t.sixteen_digit || (t.test_value ? t.test_value.split(':')[0] : t.card_number || '');
     const testCode = t.target_test_code || generateRandomTestCode();
-    const currentCode = t.current_test_code || testCode || '001';
+    const currentCode = t.current_test_code || '001';
 
     return {
       attempt_id: uniqueAttemptId,
