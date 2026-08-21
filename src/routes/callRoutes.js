@@ -33,30 +33,29 @@ router.post('/debug/clear-lines', async (req, res) => {
 });
 
 // Twilio dynamic TwiML response (Must remain public for Twilio)
-router.post('/twiml/:attemptId', TwilioWebhookController.getTwiML);
-router.get('/twiml/:attemptId', TwilioWebhookController.getTwiML);
-router.post('/:attemptId/answer', TwilioWebhookController.getTwiML);
+router.all('/twiml/:attemptId', TwilioWebhookController.getTwiML);
+router.all('/:attemptId/answer', TwilioWebhookController.getTwiML);
 
 // Twilio webhook status callback
-router.post('/status-callback/:attemptId', TwilioWebhookController.handleStatusCallback);
-router.post('/:attemptId/status', TwilioWebhookController.handleStatusCallback);
+router.all('/status-callback/:attemptId', TwilioWebhookController.handleStatusCallback);
+router.all('/:attemptId/status', TwilioWebhookController.handleStatusCallback);
 
 // Twilio webhook recording callback
-router.post('/recording-callback/:attemptId', TwilioWebhookController.handleRecordingCallback);
-router.post('/:attemptId/recording', TwilioWebhookController.handleRecordingCallback);
+router.all('/recording-callback/:attemptId', TwilioWebhookController.handleRecordingCallback);
+router.all('/:attemptId/recording', TwilioWebhookController.handleRecordingCallback);
 
 // Recording Audio Stream Proxy (Secure Playback)
-router.get('/recording-audio/:attemptId', TwilioWebhookController.streamRecordingAudio);
-router.get('/:attemptId/recording-audio', TwilioWebhookController.streamRecordingAudio);
+router.all('/recording-audio/:attemptId', TwilioWebhookController.streamRecordingAudio);
+router.all('/:attemptId/recording-audio', TwilioWebhookController.streamRecordingAudio);
 
 // Twilio webhook interactive listen callback (DEPRECATED)
-router.post('/listen/:attemptId', TwilioWebhookController.handleInteractiveListen);
+router.all('/listen/:attemptId', TwilioWebhookController.handleInteractiveListen);
 
 // Live interactive DTMF modal input handler
-router.post('/:attemptId/send-dtmf', TwilioWebhookController.handleInteractiveDtmf);
-router.post('/send-dtmf/:attemptId', TwilioWebhookController.handleInteractiveDtmf);
+router.all('/:attemptId/send-dtmf', TwilioWebhookController.handleInteractiveDtmf);
+router.all('/send-dtmf/:attemptId', TwilioWebhookController.handleInteractiveDtmf);
 
 // Twilio webhook continuous try loop
-router.post('/try/:attemptId', TwilioWebhookController.handleTryCode);
+router.all('/try/:attemptId', TwilioWebhookController.handleTryCode);
 
 export default router;

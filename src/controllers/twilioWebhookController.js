@@ -12,6 +12,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const AUDIO_DIR = path.join(__dirname, '../../audio_files');
 
+const resolveHostUrl = (req) => {
+  if (process.env.SERVER_URL && process.env.SERVER_URL.trim()) {
+    let u = process.env.SERVER_URL.trim();
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = `https://${u}`;
+    return u.replace(/\/+$/, '');
+  }
+  if (process.env.RENDER_EXTERNAL_URL && process.env.RENDER_EXTERNAL_URL.trim()) {
+    let u = process.env.RENDER_EXTERNAL_URL.trim();
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = `https://${u}`;
+    return u.replace(/\/+$/, '');
+  }
+  if (process.env.RENDER_EXTERNAL_HOSTNAME && process.env.RENDER_EXTERNAL_HOSTNAME.trim()) {
+    return `https://${process.env.RENDER_EXTERNAL_HOSTNAME.trim()}`.replace(/\/+$/, '');
+  }
+  if (req) {
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https' || req.protocol === 'https';
+    const proto = isHttps ? 'https' : (req.protocol || 'http');
+    const host = req.get('host');
+    return `${proto}://${host}`.replace(/\/+$/, '');
+  }
+  return 'http://localhost:5000';
+};
+
 // Generate TwiML for when the call is answered (Outbound Automated QA Flow)
 export const getTwiML = async (req, res) => {
   const { attemptId } = req.params;
@@ -45,7 +68,7 @@ export const getTwiML = async (req, res) => {
       await AttemptModel.updateAttemptStatus(attemptId, 'VALIDATING_16_DIGIT');
 
       // Use Twilio's Redirect verb to jump to code testing loop
-      const host = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
+      const host = resolveHostUrl(req);
       twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?currentTestCode=${testCode}&isFirst=true`);
 
     } else {
@@ -157,7 +180,7 @@ export const handleTryCode = async (req, res) => {
   } else {
     const nextTestCode = endCodeNum.toString().padStart(3, '0');
     twiml.pause({ length: 1 });
-    const host = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
+    const host = resolveHostUrl(req);
     twiml.redirect({ method: 'POST' }, `${host}/api/call/try/${attemptId}?currentTestCode=${nextTestCode}&isFirst=false`);
   }
 

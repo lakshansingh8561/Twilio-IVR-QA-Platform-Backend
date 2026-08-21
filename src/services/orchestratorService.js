@@ -183,8 +183,25 @@ export const tick = async () => {
     }
 };
 
+const resolveHostUrl = () => {
+  if (process.env.SERVER_URL && process.env.SERVER_URL.trim()) {
+    let u = process.env.SERVER_URL.trim();
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = `https://${u}`;
+    return u.replace(/\/+$/, '');
+  }
+  if (process.env.RENDER_EXTERNAL_URL && process.env.RENDER_EXTERNAL_URL.trim()) {
+    let u = process.env.RENDER_EXTERNAL_URL.trim();
+    if (!u.startsWith('http://') && !u.startsWith('https://')) u = `https://${u}`;
+    return u.replace(/\/+$/, '');
+  }
+  if (process.env.RENDER_EXTERNAL_HOSTNAME && process.env.RENDER_EXTERNAL_HOSTNAME.trim()) {
+    return `https://${process.env.RENDER_EXTERNAL_HOSTNAME.trim()}`.replace(/\/+$/, '');
+  }
+  return 'http://localhost:5000';
+};
+
 export const executeCall = async (attempt, line) => {
-    const host = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL || 'http://localhost:5000';
+    const host = resolveHostUrl();
     const client = getTwilioClient();
 
     if (!client) {
