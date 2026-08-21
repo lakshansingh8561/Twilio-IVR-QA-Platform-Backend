@@ -67,7 +67,7 @@ if (!fs.existsSync(AUDIO_DIR)) {
         
         let attemptedCodes = [];
         logsArr.forEach(l => {
-            const match = l.match(/DTMF Sent: \d{16}:(\d{3})/);
+            const match = l.match(/(?:DTMF Sent: \d{16}:|Testing code:\s*)(\d{3})/);
             if (match) attemptedCodes.push(match[1]);
         });
         
@@ -157,6 +157,10 @@ if (!fs.existsSync(AUDIO_DIR)) {
    */
   export const downloadFile = (url, destPath) => {
     return new Promise((resolve, reject) => {
+      let downloadUrl = url;
+      if (downloadUrl && !downloadUrl.endsWith('.mp3') && !downloadUrl.endsWith('.wav')) {
+        downloadUrl += '.mp3';
+      }
       const file = fs.createWriteStream(destPath);
       
       const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -169,7 +173,7 @@ if (!fs.existsSync(AUDIO_DIR)) {
         }
       };
       
-      https.get(url, options, (response) => {
+      https.get(downloadUrl, options, (response) => {
         if (response.statusCode === 302) {
           // Follow redirect if Twilio redirects to S3
           https.get(response.headers.location, (redirectResponse) => {

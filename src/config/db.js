@@ -38,19 +38,39 @@ const initializeDatabase = async () => {
       console.log('Successfully reset all phone lines status to idle on startup.');
     }
 
-    // Crash Recovery: Reset stuck 'active' attempts to 'retry'
+    // Crash Recovery: Reset stuck 'active', 'in_progress', 'testing_3digit' attempts to 'retry'
     const { error: attemptError } = await supabase
       .from('attempts')
       .update({ status: 'retry' })
-      .eq('status', 'active');
+      .in('status', ['active', 'in_progress', 'testing_3digit']);
 
     if (attemptError) {
-      console.error('Failed to reset stuck attempts on boot:', attemptError);
+      console.error('Failed to reset stuck attempts on boot:', attemptError.message);
     } else {
-      console.log('Successfully swept stuck active attempts to retry.');
+      console.log('Successfully swept stuck active/in_progress attempts to retry.');
     }
   } catch (err) {
     console.error('Error during crash recovery on startup:', err);
+  }
+
+  // Milestone 2 Schema Verification: Check attempts table for Milestone 2 columns
+  try {
+    const { data: testRow, error: checkError } = await supabase
+      .from('attempts')
+      .select('attempt_id, sixteen_digit, target_test_code, current_test_code')
+      .limit(1);
+
+    if (checkError) {
+      console.warn('\n======================================================');
+      console.warn('NOTICE: Milestone 2 columns might be missing in "attempts" table.');
+      console.warn('Details:', checkError.message);
+      console.warn('To ensure production-level compatibility, run backend/data/milestone2_schema.sql in your Supabase SQL Editor.');
+      console.warn('======================================================\n');
+    } else {
+      console.log('Milestone 2 database schema verified successfully.');
+    }
+  } catch (err) {
+    console.warn('Schema check warning:', err.message);
   }
 
   // Verify admins table exists and seed default admin

@@ -7,13 +7,29 @@ import callRoutes from './routes/callRoutes.js';
 import http from 'http';
 import { initializeWebSocket } from './services/websocketService.js';
 
+import { createProxyMiddleware } from 'http-proxy-middleware';
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
+const MOCK_IVR_URL = process.env.MOCK_IVR_URL || 'http://localhost:5001';
+
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Proxy /api/mock-ivr/* → Mock IVR server (port 5001)
+// This allows a single ngrok tunnel on port 5000 to serve both backend + mock IVR
+app.use('/api/mock-ivr', createProxyMiddleware({
+  target: MOCK_IVR_URL,
+  changeOrigin: true,
+  on: {
+    proxyReq: (proxyReq, req) => {
+      console.log(`[Proxy] ${req.method} ${req.path} → ${MOCK_IVR_URL}${req.path}`);
+    }
+  }
+}));
 
 // Routing
 app.use('/api/call', callRoutes);

